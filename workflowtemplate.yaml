@@ -1,0 +1,137 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: argocd-application-resource-operation
+  namespace: argo
+  labels:
+    app.kubernetes.io/name: argocd-application-resource-operation
+spec:
+  entrypoint: operate
+  serviceAccountName: workflow-runner
+  arguments:
+    parameters:
+      # Environment is used to select the Argo CD endpoint and token file.
+      - name: env
+        value: dev
+      # Argo CD Application name.
+      - name: application
+        value: ''
+      # Pass operation/resources as a JSON string. See examples below.
+      - name: payload
+        value: '{}'
+  templates:
+    - name: operate
+      inputs:
+        parameters:
+          - name: env
+          - name: application
+          - name: payload
+      script:
+        image: alpine/k8s:1.31.0
+        command: [bash]
+        env:
+          - name: OP_ENV
+            value: "{{inputs.parameters.env}}"
+          - name: OP_APPLICATION
+            value: "{{inputs.parameters.application}}"
+          - name: OP_PAYLOAD
+            value: "{{inputs.parameters.payload}}"
+        volumeMounts:
+          - name: argocd-endpoints
+            mountPath: /etc/argocd-endpoints
+            readOnly: true
+          - name: argocd-tokens
+            mountPath: /var/run/argocd-tokens
+            readOnly: true
+        source: |
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          env_name="${OP_ENV}"
+          application="${OP_APPLICATION}"
+          payload="${OP_PAYLOAD}"
+
+          [[ -n "${application}" ]] || { echo "application input parameter is required" >&2; exit 1; }
+          jq -e . >/dev/null <<<"${payload}" || { echo "payload is not valid JSON" >&2; exit 1; }
+          jq -e 'type == "object"' >/dev/null <<<"${payload}" || { echo "payload must be a JSON object" >&2; exit 1; }
+
+          endpoint_file=/etc/argocd-endpoints/endpoints.json
+          token_file="/var/run/argocd-tokens/${env_name}"
+          server="$(jq -er --arg env "${env_name}" '.[$env]' "${endpoint_file}")"
+          token="$(<"${token_file}")"
+          [[ -n "${server}" ]] || { echo "unknown env: ${env_name}" >&2; exit 1; }
+          [[ -n "${token}" ]] || { echo "empty Argo CD token for env: ${env_name}" >&2; exit 1; }
+          server="${server%/}"
+
+          curl_args=(--fail-with-body --silent --show-error --max-time 60
+            -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json')
+          if [[ "$(jq -r '.options.insecureTLS // false' <<<"${payload}")" == "true" ]]; then
+            curl_args+=(--insecure)
+          fi
+
+          # Normalize the payload to an array. The single-operation form remains supported.
+          operations_json="$(jq -c 'if has("operations") then .operations else [{operation: (.operation // .action), resources: .resources}] end' <<<"${payload}")"
+          jq -e 'type == "array" and length > 0' >/dev/null <<<"${operations_json}" || {
+            echo 'payload.operations must be a non-empty array' >&2; exit 1;
+          }
+
+          app_path="${server}/api/v1/applications/$(jq -rn --arg v "${application}" '$v|@uri')"
+          failures=0
+          operation_index=0
+
+          while IFS= read -r operation_json; do
+            operation_index=$((operation_index + 1))
+            operation="$(jq -r '.operation // .action // empty' <<<"${operation_json}")"
+            case "${operation}" in
+              resync|sync) operation=sync ;;
+              delete) ;;
+              *) echo "operations[$((operation_index - 1))].operation must be resync|sync|delete" >&2; exit 1 ;;
+            esac
+
+            resources_json="$(jq -c '.resources // empty' <<<"${operation_json}")"
+            jq -e 'type == "array" and length > 0' >/dev/null <<<"${resources_json}" || {
+              echo "operations[$((operation_index - 1))].resources must be a non-empty array" >&2; exit 1;
+            }
+
+            while IFS= read -r resource; do
+              name="$(jq -r '.name // empty' <<<"${resource}")"
+              kind="$(jq -r '.kind // empty' <<<"${resource}")"
+              group="$(jq -r '.group // ""' <<<"${resource}")"
+              version="$(jq -r '.version // "v1"' <<<"${resource}")"
+              namespace="$(jq -r '.namespace // ""' <<<"${resource}")"
+              [[ -n "${name}" && -n "${kind}" ]] || {
+                echo 'each resource requires name and kind' >&2; failures=$((failures + 1)); continue;
+              }
+              identity="${group:-core}/${version}/${kind}/${namespace:--}/${name}"
+
+              if [[ "${operation}" == sync ]]; then
+                body="$(jq -cn --arg g "${group}" --arg v "${version}" --arg k "${kind}" \
+                  --arg n "${namespace}" --arg name "${name}" \
+                  '{resources: [{group: $g, version: $v, kind: $k, namespace: $n, name: $name}]}')"
+                if curl "${curl_args[@]}" -X POST "${app_path}/sync" -d "${body}" >/dev/null; then
+                  echo "OK sync ${identity}"
+                else
+                  echo "FAILED sync ${identity}" >&2; failures=$((failures + 1))
+                fi
+              else
+                query="$(jq -rn --arg rn "${name}" --arg v "${version}" --arg g "${group}" \
+                  --arg k "${kind}" --arg ns "${namespace}" \
+                  '["resourceName=" + $rn, "version=" + $v, "group=" + $g, "kind=" + $k, "namespace=" + $ns] | join("&")')"
+                if curl "${curl_args[@]}" -X POST "${app_path}/resource/actions?${query}" \
+                  -d '{"action":"delete"}' >/dev/null; then
+                  echo "OK delete ${identity}"
+                else
+                  echo "FAILED delete ${identity}" >&2; failures=$((failures + 1))
+                fi
+              fi
+            done < <(jq -c '.resources[]' <<<"${resources_json}")
+          done < <(jq -c '.[]' <<<"${operations_json}")
+
+          [[ "${failures}" -eq 0 ]] || { echo "${failures} resource operation(s) failed" >&2; exit 1; }
+      volumes:
+        - name: argocd-endpoints
+          configMap:
+            name: argocd-resource-operation-endpoints
+        - name: argocd-tokens
+          secret:
+            secretName: argocd-resource-operation-tokens
